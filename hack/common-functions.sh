@@ -4,6 +4,116 @@ ROOT="$(dirname "$SCRIPT_DIR")"
 KONFLUX_YAML="$ROOT/config/downstream/konflux.yaml"
 REPO_DIR="$ROOT/config/downstream/repos/"
 
+function is-rc-version() {
+  local version=$1
+  if [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-RC-[0-9]+$ ]]; then
+    return 0
+  fi
+  return 1
+}
+
+function is-x.y.0-release() {
+  local version=$1
+  if [[ "$version" =~ ^[0-9]+\.[0-9]+\.0$ ]]; then
+    return 0
+  fi
+  return 1
+}
+
+function extract-rc-number() {
+  local version=$1
+  echo "$version" | sed -E 's/.*-RC-([0-9]+)$/\1/'
+}
+
+function extract-base-version() {
+  local version=$1
+  echo "$version" | sed -E 's/-RC-[0-9]+$//'
+}
+
+function extract-minor-version() {
+  local version=$1
+  echo "$version" | sed -E 's/^([0-9]+\.[0-9]+)\..*/\1/'
+}
+
+
+function finalize-rc-release() {
+  RELEASE_VERSION=$1
+  RELEASE_YAML="$ROOT/config/downstream/releases/${RELEASE_VERSION}.yaml"
+
+  patch_version=$(yq ".patch-version" $RELEASE_YAML)
+
+  if ! is-rc-version "$patch_version"; then
+    echo "Version $patch_version is not an RC version. Nothing to finalize."
+    exit 0
+  fi
+
+  base_ver=$(extract-base-version "$patch_version")
+  yq -i e ".patch-version = \"$base_ver\"" $RELEASE_YAML
+  yq -i e ".is-rc = false" $RELEASE_YAML
+  yq -i e ".rc-number = 0" $RELEASE_YAML
+
+  echo "Finalized RC release: $base_ver"
+}
+
+function is-auto-update-allowed() {
+  local release_version=$1
+  local release_yaml="$ROOT/config/downstream/releases/${release_version}.yaml"
+
+  if [[ "$release_version" == "next" ]]; then
+    return 0
+  fi
+
+  patch_version=$(yq ".patch-version" $release_yaml 2>/dev/null || echo "")
+
+  if is-rc-version "$patch_version"; then
+    return 0
+  fi
+
+  if is-x.y.0-release "$patch_version"; then
+    return 1
+  fi
+
+  return 1
+}
+
+function create-new-rc() {
+  RELEASE_VERSION=$1
+  RELEASE_YAML="$ROOT/config/downstream/releases/${RELEASE_VERSION}.yaml"
+  touch $RELEASE_YAML
+
+  patch_version=$(yq ".patch-version" $RELEASE_YAML)
+  echo "Current Patch Version $patch_version"
+
+  if is-rc-version "$patch_version"; then
+    rc_num=$(extract-rc-number "$patch_version")
+    base_ver=$(extract-base-version "$patch_version")
+    if [[ $rc_num -ge 2 ]]; then
+      echo "RC-$rc_num reached. Automatically switching to full release."
+      yq -i e ".is-rc = false" $RELEASE_YAML
+      yq -i e ".rc-number = 0" $RELEASE_YAML
+      next_version="$base_ver"
+    else
+      next_rc=$((rc_num + 1))
+      next_version="${base_ver}-RC-${next_rc}"
+      yq -i e ".rc-number = $next_rc" $RELEASE_YAML
+    fi
+  else
+    if [[ -z "$patch_version" || "$patch_version" == "null" ]]; then
+      next_version="${RELEASE_VERSION}.0-RC-1"
+    else
+      base_ver=$(echo "$patch_version" | sed -E 's/-RC-[0-9]+$//')
+      next_version="${base_ver}-RC-1"
+    fi
+    yq -i e ".is-rc = true" $RELEASE_YAML
+    yq -i e ".rc-number = 1" $RELEASE_YAML
+  fi
+
+  create-new-release $@
+
+  echo "Next RC Version: $next_version"
+  yq -i e ".patch-version = \"$next_version\"" $RELEASE_YAML
+}
+
 function create-new-release() {
   RELEASE_VERSION=$1
   RELEASE_YAML="$ROOT/config/downstream/releases/${RELEASE_VERSION}.yaml"
@@ -47,20 +157,18 @@ function create-new-patch(){
   yq -i e ".patch-version = \"$next_version\"" $RELEASE_YAML
 }
 
-update-upstream-versions() {
+function update-upstream-versions() {
   RELEASE_VERSION=$1
   RELEASE_YAML="$ROOT/config/downstream/releases/${RELEASE_VERSION}.yaml"
   touch $RELEASE_YAML
   echo "Updating upstream version for release : $RELEASE_VERSION in $RELEASE_YAML"
 
   for file in "$REPO_DIR"/*.yaml; do
-    [ -e "$file" ] || continue  # Skip if no files
+    [ -e "$file" ] || continue # Skip if no files
 
-    # Extract values with yq
     downstream="$(basename "$file" .yaml)"
     upstream=$(yq e '.upstream' "$file")
     UsePatchBranch=$(yq e '.use-patch-branch' "$file")
-    # Skip when upstream is empty
     [ "$upstream" = "null" ] && upstream=""
     if [[ -z "$upstream" || "$upstream" == "tektoncd/operator" ]]; then
       continue
@@ -82,7 +190,5 @@ update-upstream-versions() {
     yq -i e ".branches.$downstream.upstream = \"$BRANCH\"" $RELEASE_YAML
   done
 }
-
-
 
 
