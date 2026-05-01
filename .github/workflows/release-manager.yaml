@@ -2,8 +2,8 @@ name: Automated Release Actions
 run-name: Execute ${{ github.event.inputs.action || 'update-upstream-versions' }} for version ${{ github.event.inputs.version || 'next' }}
 
 on:
-  schedule:
-    - cron: "0 0 * * *" # At every day at 00
+  # schedule:
+  #   - cron: "0 0 * * *" # At every day at 00
   workflow_dispatch:
     inputs:
       action:
