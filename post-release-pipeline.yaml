@@ -1,0 +1,311 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: post-release-nudge-tests
+  namespace: tekton-ecosystem-tenant
+  annotations:
+    description: |
+      Post-release nudge pipeline that automatically updates component image digests
+      in the openshift-pipelines/operator repository after successful Konflux releases.
+    owned-by: athorp
+spec:
+  params:
+    - name: release
+      type: string
+      description: NamespacedName of the Release (namespace/name)
+    - name: snapshot
+      type: string
+      description: NamespacedName of the Snapshot (namespace/name)
+    - name: releasePlan
+      type: string
+      description: NamespacedName of the ReleasePlan (namespace/name)
+  tasks:
+    - name: update-component-images
+      taskSpec:
+        params:
+          - name: release
+            type: string
+          - name: snapshot
+            type: string
+          - name: releasePlan
+            type: string
+          - name: pipelinerun_namespace
+            type: string
+          - name: pipelinerun_name
+            type: string
+
+        steps:
+          - name: update-images-and-create-pr
+            image: quay.io/konflux-ci/appstudio-utils:latest
+            env:
+              - name: GITHUB_TOKEN
+                valueFrom:
+                  secretKeyRef:
+                    name: my-github-secret
+                    key: token
+            script: |
+              #!/usr/bin/env bash
+              set -euo pipefail
+
+              echo "============================================"
+              echo "Phase 1: Checking Release Status"
+              echo "============================================"
+
+              IFS='/' read -r RELEASE_NAMESPACE RELEASE_NAME <<< "$(params.release)"
+
+              # Get release status
+              # A Managed Pipeline succeeding would be a prod release
+              # A tenant pipeline would indicate a non-prod release
+              RELEASE_SUCCEEDED=$(kubectl get release "$RELEASE_NAME" -n "$RELEASE_NAMESPACE" \
+                -o jsonpath='{.status.conditions}' | jq '. | any((.type == "ManagedPipelineProcessed" or .type == "TenantPipelineProcessed") and .reason == "Succeeded")')
+
+              # Get application label
+              APPLICATION=$(kubectl get release "$RELEASE_NAME" -n "$RELEASE_NAMESPACE" \
+                -o jsonpath='{.metadata.labels.appstudio\.openshift\.io/application}')
+
+              echo "Release: $RELEASE_NAME"
+              echo "Succeeded: $RELEASE_SUCCEEDED"
+              echo "Application: $APPLICATION"
+
+              # Exit early if release did not succeed
+              if [ "$RELEASE_SUCCEEDED" != "true" ]; then
+                echo "ERROR: Release status is not 'Succeeded'. Skipping image updates."
+                exit 0
+              fi
+
+              echo "Release succeeded. Proceeding with image updates."
+
+              echo ""
+              echo "============================================"
+              echo "Phase 2: Extracting Images from Snapshot"
+              echo "============================================"
+
+              IFS='/' read -r SNAPSHOT_NAMESPACE SNAPSHOT_NAME <<< "$(params.snapshot)"
+
+              # Get all containerImage values from the Snapshot's components
+              IMAGES=$(kubectl get snapshot "$SNAPSHOT_NAME" -n "$SNAPSHOT_NAMESPACE" \
+                -o jsonpath='{.spec.components[*].containerImage}')
+
+              # Build JSON array of {name, digest} objects
+              IMAGE_MAP="[]"
+              for img in $IMAGES; do
+                # Extract image name: last path segment before @
+                NAME=$(echo "$img" | rev | cut -d'/' -f1 | rev | cut -d'@' -f1)
+                # Extract digest (including 'sha256:' prefix)
+                DIGEST=$(echo "$img" | cut -d'@' -f2)
+
+                IMAGE_MAP=$(echo "$IMAGE_MAP" | jq --arg name "$NAME" --arg digest "$DIGEST" \
+                  '. + [{"name": $name, "digest": $digest}]')
+              done
+
+              IMAGE_COUNT=$(echo "$IMAGE_MAP" | jq length)
+
+              if [ "$IMAGE_COUNT" -eq 0 ]; then
+                echo "WARNING: No images found in Snapshot - nothing to update"
+                exit 1
+              fi
+
+              echo "Extracted $IMAGE_COUNT images"
+
+              echo ""
+              echo "============================================"
+              echo "Phase 3: Clone Repo and Update Digests"
+              echo "============================================"
+
+              # --- Determine target branch ---
+              TARGET_BRANCH=$(kubectl get snapshot "$SNAPSHOT_NAME" -n "$SNAPSHOT_NAMESPACE" \
+                -o jsonpath='{.metadata.annotations.build\.appstudio\.redhat\.com/target_branch}')
+
+              if [ -z "$TARGET_BRANCH" ]; then
+                echo "ERROR: target_branch annotation not found on Snapshot"
+                exit 1
+              fi
+
+              # Map target branch to operator release branch
+              # Non-release branches like `next` are unaffected
+              # Pattern: release-vX.Y.Z -> release-vX.Y.x
+              RELEASE_BRANCH=$(echo "$TARGET_BRANCH" | sed -E 's/^(release-v[0-9]+\.[0-9]+)\.[0-9]+$/\1.x/')
+
+              echo "Target branch from Snapshot: $TARGET_BRANCH"
+              echo "Mapped release branch: $RELEASE_BRANCH"
+
+              # --- Configure git with GitHub App token (from env) ---
+              # TODO: get these from parameters?
+              git config --global user.name "openshift-pipelines-bot"
+              git config --global user.email "pipelines-extcomm@redhat.com"
+
+              # --- Clone the operator repository ---
+              cd "$(mktemp -d)"
+              git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/openshift-pipelines/operator.git" operator
+              cd operator
+
+              # --- Checkout the release branch ---
+              git checkout "$RELEASE_BRANCH"
+
+              # --- Checkout or create the upgrade branch ---
+              UPGRADE_BRANCH="konflux/post-release-component-upgrades/testing/${RELEASE_BRANCH}"
+
+              if git ls-remote --heads origin "$UPGRADE_BRANCH" | grep -q "$UPGRADE_BRANCH"; then
+                echo "Upgrade branch exists remotely, checking out"
+                git checkout -b "$UPGRADE_BRANCH" "origin/$UPGRADE_BRANCH"
+              else
+                echo "Creating new upgrade branch"
+                git checkout -b "$UPGRADE_BRANCH"
+              fi
+
+              # --- Update digests ---
+              for i in $(seq 0 $((IMAGE_COUNT - 1))); do
+                IMG_NAME=$(echo "$IMAGE_MAP" | jq -r ".[$i].name")
+                IMG_DIGEST=$(echo "$IMAGE_MAP" | jq -r ".[$i].digest")
+
+                echo "Processing image: $IMG_NAME -> $IMG_DIGEST"
+
+                echo "  Updating: project.yaml"
+                sed -i -E "s|(/${IMG_NAME}@)sha256:[a-f0-9]{64}|\1${IMG_DIGEST}|g" project.yaml
+              done
+
+              # --- Commit and push if changes were made ---
+              # Exit early if no changes were mande
+              if git diff --quiet; then
+                echo "No changes to commit"
+              fi
+
+              PR_NAMESPACE="$(params.pipelinerun_namespace)"
+              PR_NAME="$(params.pipelinerun_name)"
+
+              KONFLUX_BASE="https://konflux-ui.apps.kflux-prd-rh02.0fk9.p1.openshiftapps.com"
+              RELEASE_LINK="${KONFLUX_BASE}/ns/${PR_NAMESPACE}/applications/${APPLICATION}/releases/${RELEASE_NAME}"
+              PIPELINERUN_LINK="${KONFLUX_BASE}/ns/${PR_NAMESPACE}/pipelinerun/${PR_NAME}"
+
+              git add -A
+              COMMIT_MSG="chore(deps): Upgrade pipelines component images"
+              COMMIT_MSG="${COMMIT_MSG}\n\nImage digests sourced from ${RELEASE_LINK}"
+              COMMIT_MSG="${COMMIT_MSG}\nGenerated by ${PIPELINERUN_LINK}"
+              echo -e "$COMMIT_MSG" | git commit -F -
+
+              # TODO: Push the changes
+              echo "Changes committed and would be pushed:"
+              git show
+              git push "https://x-access-token:${GITHUB_TOKEN}@github.com/openshift-pipelines/operator.git" "$UPGRADE_BRANCH"
+              echo "Changes committed and pushed successfully"
+
+              echo ""
+              echo "============================================"
+              echo "Phase 4: Create or Update Pull Request"
+              echo "============================================"
+
+              PR_NAMESPACE="$(params.pipelinerun_namespace)"
+              PR_NAME="$(params.pipelinerun_name)"
+
+              REPO_OWNER="openshift-pipelines"
+              REPO_NAME="operator"
+              API_BASE="https://api.github.com/repos/${REPO_OWNER}/${REPO_NAME}"
+
+              # --- Build PR title ---
+              PR_TITLE="chore(deps): Update ${RELEASE_BRANCH} component images"
+
+              # --- Build PR body ---
+              IMAGE_LIST=""
+              for i in $(seq 0 $((IMAGE_COUNT - 1))); do
+                NAME=$(echo "$IMAGE_MAP" | jq -r ".[$i].name")
+                DIGEST=$(echo "$IMAGE_MAP" | jq -r ".[$i].digest")
+                IMAGE_LIST="${IMAGE_LIST}- \`${NAME}@${DIGEST}\`\n"
+              done
+
+              PR_BODY=$(cat <<EOF
+              ## Component Image Updates
+
+              This PR updates component image digests in the operator repository.
+
+              ### Updated Images
+              ${IMAGE_LIST}
+
+              ### Links
+              - [Release](${RELEASE_LINK})
+              - [PipelineRun](${PIPELINERUN_LINK})
+
+              ---
+              *This PR was auto-generated by the post-release nudge pipeline.*
+              EOF
+              )
+
+              # --- Check if a PR already exists ---
+              EXISTING_PR=$(curl -s -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "${API_BASE}/pulls?head=${REPO_OWNER}:${UPGRADE_BRANCH}&base=${RELEASE_BRANCH}&state=open" \
+                | jq '.[0].number // empty')
+
+              if [ -n "$EXISTING_PR" ]; then
+                echo "Updating existing PR #${EXISTING_PR}"
+
+                # Update title and body via PATCH
+                curl -s -X PATCH \
+                  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${API_BASE}/pulls/${EXISTING_PR}" \
+                  -d "$(jq -n --arg title "$PR_TITLE" --arg body "$PR_BODY" \
+                    '{title: $title, body: $body}')"
+
+                echo "PR updated: https://github.com/${REPO_OWNER}/${REPO_NAME}/pull/${EXISTING_PR}"
+              else
+                echo "Creating new PR"
+
+                RESPONSE=$(curl -s -X POST \
+                  -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${API_BASE}/pulls" \
+                  -d "$(jq -n \
+                    --arg title "$PR_TITLE" \
+                    --arg body "$PR_BODY" \
+                    --arg head "$UPGRADE_BRANCH" \
+                    --arg base "$RELEASE_BRANCH" \
+                    '{title: $title, body: $body, head: $head, base: $base}')")
+
+                PR_NUMBER=$(echo "$RESPONSE" | jq '.number')
+                echo "PR created: https://github.com/${REPO_OWNER}/${REPO_NAME}/pull/${PR_NUMBER}"
+              fi
+
+              echo ""
+              echo "============================================"
+              echo "Pipeline completed successfully"
+              echo "============================================"
+      params:
+        - name: release
+          value: "$(params.release)"
+        - name: snapshot
+          value: "$(params.snapshot)"
+        - name: releasePlan
+          value: "$(params.releasePlan)"
+        - name: pipelinerun_namespace
+          value: "$(context.pipelineRun.namespace)"
+        - name: pipelinerun_name
+          value: "$(context.pipelineRun.name)"
+
+  # ==========================================================================
+  # Finally: Notify Slack on Failure
+  # ==========================================================================
+  # finally:
+  #   - name: notify-slack-on-failure
+  #     taskRef:
+  #       resolver: git
+  #       params:
+  #         - name: url
+  #           value: https://github.com/konflux-ci/community-catalog.git
+  #         - name: revision
+  #           value: development
+  #         - name: pathInRepo
+  #           value: tasks/notify-slack-on-failure/notify-slack-on-failure.yaml
+  #     params:
+  #       - name: secretName
+  #         value: slack-webhook-secret
+  #       - name: secretKeyName
+  #         value: webhook-url
+  #       - name: release
+  #         value: "$(params.release)"
+  #       - name: notifySuccess
+  #         value: "false"
+  #       - name: slackHandles
+  #         value: ""
+  #       - name: tagSuccess
+  #         value: "false"
